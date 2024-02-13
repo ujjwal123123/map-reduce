@@ -14,10 +14,22 @@
 
 struct parsed_tuple {
     int user_id;
-    char action;
     std::string topic;
     int score;
 };
+
+struct MapperArgs {
+    int slot_count;
+    int user_count;
+};
+
+int const END_OF_STREAM = -2;
+
+void handle_error(const char *msg, int line) {
+    std::cerr << "Error: " << __FILE__ << ":" << line << " " << msg << std::endl
+              << std::flush;
+    exit(EXIT_FAILURE);
+}
 
 template <typename T> class sharedQueue {
   private:
@@ -31,40 +43,32 @@ template <typename T> class sharedQueue {
     int capacity;
 
     void assertSize() {
-        if (queue_size == 0) {
-            throw std::runtime_error("Queue is empty");
-        }
-
-        assert((end - start) % capacity == queue_size);
+        assert((capacity + end - start) % capacity == queue_size);
     }
 
   public:
     sharedQueue(int capacity) {
         pthread_mutex_init(&mutex, NULL);
-        this->array = new T[capacity];
+        this->array = new parsed_tuple[capacity];
         this->capacity = capacity;
     }
 
     ~sharedQueue() {
         pthread_mutex_destroy(&mutex);
-        delete[] array;
+        // delete[] array;
     }
 
+    // producer
     void push(parsed_tuple t) {
-        // producer
-
-        std::cout << "Pushing " << t.user_id << " " << t.score << " "
-                  << t.action << " " << t.topic << std::endl;
-
         int s = pthread_mutex_lock(&mutex);
         if (s != 0) {
-            throw std::runtime_error("Error locking mutex");
+            handle_error("Error locking mutex", __LINE__);
         }
 
         while (queue_size == capacity) {
             s = pthread_cond_wait(&not_full, &mutex);
             if (s != 0) {
-                throw std::runtime_error("Error waiting on condition variable");
+                handle_error("Error waiting on condition variable", __LINE__);
             }
         }
 
@@ -72,46 +76,45 @@ template <typename T> class sharedQueue {
         end = (end + 1) % capacity;
         queue_size++;
         assertSize();
-        s = pthread_mutex_unlock(&mutex);
 
-        if (this->size() == 1) {
-            s = pthread_cond_signal(&not_empty);
-            if (s != 0) {
-                throw std::runtime_error("Error signaling condition variable");
-            }
-        }
+        s = pthread_mutex_unlock(&mutex);
         if (s != 0) {
-            throw std::runtime_error("Error unlocking mutex");
+            handle_error("Error unlocking mutex", __LINE__);
         }
+        s = pthread_cond_signal(&not_empty);
+        if (s != 0) {
+            handle_error("Error signaling condition variable", __LINE__);
+        }
+        std::cout << "Pushed to index " << this->end << ": " << t.user_id << " "
+                  << t.score << " " << t.topic << std::endl;
+        std::cout << std::endl;
     }
 
-    T pop() {
+    parsed_tuple pop() {
         int s = pthread_mutex_lock(&mutex);
         if (s != 0) {
-            throw std::runtime_error("Error locking mutex");
+            handle_error("Error locking mutex", __LINE__);
         }
 
         while (queue_size == 0) {
             s = pthread_cond_wait(&not_empty, &mutex);
             if (s != 0) {
-                throw std::runtime_error("Error waiting on condition variable");
+                handle_error("Error waiting on condition variable", __LINE__);
             }
         }
 
-        T return_val = array[start];
+        parsed_tuple return_val = array[start];
         start = (start + 1) % capacity;
         queue_size--;
         assertSize();
 
-        if (this->size() == capacity - 1) {
-            s = pthread_cond_signal(&not_full);
-            if (s != 0) {
-                throw std::runtime_error("Error signaling condition variable");
-            }
-        }
         s = pthread_mutex_unlock(&mutex);
         if (s != 0) {
-            throw std::runtime_error("Error unlocking mutex");
+            handle_error("Error unlocking mutex", __LINE__);
+        }
+        s = pthread_cond_signal(&not_full);
+        if (s != 0) {
+            handle_error("Error signaling condition variable", __LINE__);
         }
 
         return return_val;
@@ -136,7 +139,7 @@ void parseLineMapper(std::string &line, int &user_id, char &action,
     topic = substr;
 }
 
-void printAndClearScores(std::map<std::string, int> &scores, int user_id) {
+void printScores(std::map<std::string, int> &scores, int user_id) {
     // print the scores
     for (auto &topic : scores) {
         std::cout << "(" << std::setfill('0') << std::setw(4) << user_id << ","
@@ -149,19 +152,27 @@ void *reducer(void *args) {
         *static_cast<sharedQueue<parsed_tuple> *>(args);
 
     std::map<std::string, int> score_table;
-    int user_id = -1;
+    int const NOT_ASSIGNED = -1;
+    int user_id = NOT_ASSIGNED;
 
     while (user_queue.size() > 0) {
         parsed_tuple tuple = user_queue.pop();
 
-        if (tuple.user_id == -1) {
-            printAndClearScores(score_table, user_id);
+        std::stringstream ss;
+        ss << "Popped " << tuple.user_id << " " << tuple.score << " "
+           << tuple.topic << std::endl;
+        std::cout << ss.str() << std::flush;
+
+        if (tuple.user_id == END_OF_STREAM) {
+            printScores(score_table, user_id);
             pthread_exit(NULL);
-        } else if (user_id == -1) {
+        } else if (user_id == NOT_ASSIGNED) {
             user_id = tuple.user_id;
         }
 
         assert(user_id == tuple.user_id);
+        assert(user_id != NOT_ASSIGNED);
+        assert(user_id != END_OF_STREAM);
 
         if (score_table.find(tuple.topic) != score_table.end()) {
             score_table[tuple.topic] += tuple.score;
@@ -195,25 +206,25 @@ void *mapper(void *args) {
         parseLineMapper(line, user_id, action, topic);
 
         int score = scoring_rules[action];
-        std::cout << "(" << user_id << "," << topic << "," << score << ")"
-                  << std::endl;
 
         if (user_to_queue_map.find(user_id) == user_to_queue_map.end()) {
             assert(next_queue_index < queues.size());
 
-            // sharedQueue<parsed_tuple> queue = queues.at(next_queue_index);
             user_to_queue_map[user_id] = next_queue_index;
             next_queue_index = next_queue_index + 1;
         }
 
         int queueIndex = user_to_queue_map[user_id];
-        sharedQueue<parsed_tuple> queue = queues.at(queueIndex);
-        queue.push(parsed_tuple{user_id, action, topic, score});
+        sharedQueue<parsed_tuple> &queue = queues.at(queueIndex);
+        std::stringstream ss;
+        ss << "Pushing to queue " << queueIndex << std::endl;
+        std::cout << ss.str() << std::flush;
+        queue.push(parsed_tuple{user_id, topic, score});
     }
 
     for (auto &queue : queues) {
         // push a sentinel value to indicate the end of the stream
-        queue.push(parsed_tuple{-1, 'X', "", 0});
+        queue.push(parsed_tuple{END_OF_STREAM, "", END_OF_STREAM});
     }
 
     pthread_exit(NULL);
@@ -231,8 +242,11 @@ int main(int argc, char *argv[]) {
     int user_count = std::stoi(argv[2]);
 
     // create queues for each user
-    std::vector<sharedQueue<parsed_tuple>> queues(
-        user_count, sharedQueue<parsed_tuple>(slot_count));
+    std::vector<sharedQueue<parsed_tuple>> queues;
+    for (int i = 0; i < user_count; i++) {
+        sharedQueue<parsed_tuple> queue(slot_count);
+        queues.push_back(queue);
+    }
 
     // create mapper thread
     pthread_t mapper_thread;
@@ -244,7 +258,7 @@ int main(int argc, char *argv[]) {
         pthread_create(&reducer_threads[i], NULL, reducer, &queues.at(i));
     }
 
-    // pthread_join(mapper_thread, NULL);
+    pthread_join(mapper_thread, NULL);
     for (int i = 0; i < user_count; i++) {
         pthread_join(reducer_threads.at(i), NULL);
     }
