@@ -33,9 +33,9 @@ void handle_error(const char *msg, int line) {
 
 template <typename T> class sharedQueue {
   private:
-    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
-    pthread_cond_t not_full = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
     parsed_tuple *array;
     int start = 0;
     int end = 0;
@@ -48,6 +48,8 @@ template <typename T> class sharedQueue {
 
   public:
     sharedQueue(int capacity) {
+        pthread_cond_init(&not_empty, NULL);
+        pthread_cond_init(&not_full, NULL);
         pthread_mutex_init(&mutex, NULL);
         this->array = new parsed_tuple[capacity];
         this->capacity = capacity;
@@ -155,7 +157,7 @@ void *reducer(void *args) {
     int const NOT_ASSIGNED = -1;
     int user_id = NOT_ASSIGNED;
 
-    while (user_queue.size() > 0) {
+    while (true) {
         parsed_tuple tuple = user_queue.pop();
 
         std::stringstream ss;
